@@ -252,6 +252,15 @@ def get_cycle_reset_time(key, item_type):
         return None
 
 
+def _fmt_minutes(m):
+    """Format a minutes value as a human-readable remaining time string."""
+    if m <= 0:
+        return "Ready"
+    h = int(m // 60)
+    mins = int(m % 60)
+    return f"in {h}h{mins:02d}m" if h > 0 else f"in {mins}m"
+
+
 def is_released(item_type, item):
     """
     Determines if the media item is currently released based on available dates.
@@ -611,12 +620,7 @@ def process_radarr():
         _, rem = get_next_search_time(c["key"])
         cnt, max_s, fails = get_cycle_stats(c["key"], "movie")
         marker = "→" if i == 0 else " "
-        def fmt_m(m):
-            if m <= 0: return "Ready"
-            h = int(m // 60)
-            mins = int(m % 60)
-            return f"in {h}h{mins:02d}m" if h > 0 else f"in {mins}m"
-        print(f"  {marker} #{i+1} {c['title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {fmt_m(rem)}")
+        print(f"  {marker} #{i+1} {c['title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {_fmt_minutes(rem)}")
     print()
     
     # Pick top candidate
@@ -844,12 +848,7 @@ def process_sonarr(series_data=None):
         cnt, max_s, fails = get_cycle_stats(key, item_type)
         _, rem = get_next_search_time(key)
         marker = "→" if i == 0 else " "
-        def fmt_m_s(m):
-            if m <= 0: return "Ready"
-            h = int(m // 60)
-            mins = int(m % 60)
-            return f"in {h}h{mins:02d}m" if h > 0 else f"in {mins}m"
-        print(f"  {marker} #{i+1} [{a['label']}] {a['print_title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {fmt_m_s(rem)}")
+        print(f"  {marker} #{i+1} [{a['label']}] {a['print_title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {_fmt_minutes(rem)}")
     print()
     
     # Execute Top Action

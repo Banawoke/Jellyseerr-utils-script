@@ -43,6 +43,7 @@ services:
       # - RELEASE_BUFFER_DAYS=7
       # - DELETION_DELAY_DAYS=2
       # - KEEP_REQUESTS_OLDER_THAN_DAYS=14
+      # - DELETE_NOT_MANAGED_JELLYSEERR=true
       # - STUCK_DOWNLOAD_MINUTES=20.0
       # - MAX_DOWNLOAD_HOURS=6.0
       # - DAEMON_INTERVAL_SECONDS=60
@@ -173,6 +174,7 @@ python3 seerr_sentinel.py import --sonarr --force-id 42
 | `RELEASE_BUFFER_DAYS` | optional | Days after release before cleanup (default: `7`) |
 | `DELETION_DELAY_DAYS` | optional | Grace period before deletion (default: `2`) |
 | `KEEP_REQUESTS_OLDER_THAN_DAYS` | optional | Keep Seerr requests older than N days (default: `14`) |
+| `DELETE_NOT_MANAGED_JELLYSEERR` | optional | Allow cleaner to delete media not tracked by Jellyseerr (default: `true`) |
 | `STUCK_DOWNLOAD_MINUTES` | optional | Minutes to wait before removing a download with <= 5% progress (default: `20.0`) |
 | `MAX_DOWNLOAD_HOURS` | optional | Maximum hours before a download is removed regardless of progress (default: `6.0`) |
 | `DAEMON_INTERVAL_SECONDS` | optional | How often the background daemon checks the timers (default: `60`) |

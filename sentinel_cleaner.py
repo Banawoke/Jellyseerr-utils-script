@@ -33,7 +33,6 @@ RADARR_API_KEY = _cfg["RADARR_API_KEY"]
 RADARR_URL = _cfg["RADARR_URL"]
 SONARR_API_KEY = _cfg["SONARR_API_KEY"]
 SONARR_URL = _cfg["SONARR_URL"]
-TARGET_TMDB_IDS = []
 TMDB_TITLE_CACHE = {}
 RELEASE_BUFFER_DAYS = int(os.environ.get("RELEASE_BUFFER_DAYS", "7"))
 DELETION_DELAY_DAYS = int(os.environ.get("DELETION_DELAY_DAYS", "2"))
@@ -129,26 +128,6 @@ def resolve_media_title(media, tmdb_api_key, media_type_hint=None):
             title = None
 
     return title
-
-def friendly_radarr_title(movie):
-    title = resolve_media_title(movie, TMDB_API_KEY, media_type_hint="movie")
-    if title:
-        return title
-    tmdb_id = movie.get("tmdbId")
-    if tmdb_id:
-        return f"TMDB {tmdb_id}"
-    return "Unknown Radarr Movie"
-
-def friendly_sonarr_title(series):
-    title = resolve_media_title(series, TMDB_API_KEY, media_type_hint="tv")
-    if title:
-        return title
-    tmdb_id = series.get("tmdbId")
-    if tmdb_id:
-        return f"TMDB {tmdb_id}"
-    return "Unknown Sonarr Series"
-
-
 
 
 def load_pending_deletions():
@@ -280,38 +259,6 @@ def decline_jellyseerr_requests(api_key, base_url, requests_to_decline):
     print(f"Declined {declined_count} Jellyseerr request(s).")
     return declined_count
 
-
-def resolve_jellyseerr_delete_requests(jellyseerr_entries, api_key, base_url):
-    if not jellyseerr_entries:
-        return []
-
-    if all(isinstance(entry, dict) for entry in jellyseerr_entries):
-        return jellyseerr_entries
-
-    request_candidates = {
-        req.get("tmdb_id"): req
-        for req in fetch_jellyseerr_requests(api_key, base_url)
-        if req.get("tmdb_id")
-    }
-
-    normalized_requests = []
-    for entry in jellyseerr_entries:
-        tmdb_id = entry
-        if isinstance(entry, dict):
-            tmdb_id = entry.get("tmdb_id")
-        if tmdb_id is None:
-            continue
-        try:
-            tmdb_id = int(tmdb_id)
-        except (TypeError, ValueError):
-            pass
-        request = request_candidates.get(tmdb_id)
-        if request:
-            normalized_requests.append(request)
-        else:
-            print(f"Warning: Jellyseerr request for TMDB ID {tmdb_id} not found in current requests.")
-
-    return normalized_requests
 
 def get_all_radarr_movies_with_status(api_key, base_url):
     headers = {"X-Api-Key": api_key}
@@ -537,13 +484,6 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
     stuck_records = []
     now = datetime.now(timezone.utc)
     
-    # Count occurrences of downloadId in queue to detect season packs (multiple episodes sharing the same download)
-    download_id_counts = {}
-    for r in records:
-        dl_id = r.get("downloadId")
-        if dl_id:
-            download_id_counts[dl_id] = download_id_counts.get(dl_id, 0) + 1
-
     # Pre-fetch library state (hasFile) for items in queue to avoid blocklisting already-imported media
     episodes_has_file = {}
     movies_has_file = {}
@@ -586,13 +526,15 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
             
         age_hours = (now - added_dt).total_seconds() / 3600.0 if added_dt else 0.0
         age_minutes = (now - added_dt).total_seconds() / 60.0 if added_dt else 0.0
-        
+
+        # Extract ep_ids once for both already_imported and status checks
+        ep_ids = r.get("episodeIds", [])
+        if not ep_ids and "episodeId" in r:
+            ep_ids = [r["episodeId"]]
+
         # Check if media is ALREADY in the library (hasFile=True)
         already_imported = False
         if app_name.lower() == "sonarr":
-            ep_ids = r.get("episodeIds", [])
-            if not ep_ids and "episodeId" in r:
-                ep_ids = [r["episodeId"]]
             if ep_ids and all(episodes_has_file.get(eid, False) for eid in ep_ids):
                 already_imported = True
         elif app_name.lower() == "radarr":
@@ -607,17 +549,6 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
             reason = f"Media is already imported in {app_name} library (hasFile=True). Clearing stale queue entry."
             should_blocklist = False
         else:
-            ep_ids = r.get("episodeIds", [])
-            if not ep_ids and "episodeId" in r:
-                ep_ids = [r["episodeId"]]
-                
-            dl_id = r.get("downloadId")
-            is_season_pack = (
-                len(ep_ids) > 1 
-                or r.get("fullSeason", False) 
-                or (dl_id is not None and download_id_counts.get(dl_id, 0) > 1)
-            )
-
             tracked_state = r.get("trackedDownloadState", "")
             tracked_status = r.get("trackedDownloadStatus", "")
             status_msgs = []
@@ -631,23 +562,33 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
                     status_msgs.append(m)
             
             msg_text = " ".join(status_msgs).lower()
-            is_unimportable_release = (
-                (tracked_status == "warning" and (progress >= 0.99 or r.get("status") == "completed"))
+            
+            # Hard failures (e.g. no video files found / sample) - immediate action
+            hard_import_failure = any(k in msg_text for k in [
+                "no files eligible", "no files found", "no video", "sample", "failed to import", "missing from"
+            ])
+            
+            # Soft warnings / ambiguities (e.g. title mismatch, multiple movies found) - subject to grace period
+            is_import_warning = (
+                tracked_state in ("importBlocked", "importFailed")
+                or (tracked_status == "warning" and (progress >= 0.99 or r.get("status") == "completed"))
                 or any(k in msg_text for k in [
-                    "not imported", "missing from", "no files", "eligible for import",
-                    "no video", "failed to import", "sample", "title mismatch",
-                    "not possible", "mismatch", "unknown series", "unknown movie", "rejected",
-                    "unable to import", "found multiple", "multiple movies", "multiple series"
+                    "title mismatch", "not possible", "mismatch", "unknown series", "unknown movie", 
+                    "rejected", "unable to import", "found multiple", "multiple movies", "multiple series"
                 ])
             )
 
-            # Blocklist if release is blocked/unimportable (no eligible files) or incomplete season pack
-            if tracked_state in ("importBlocked", "importFailed") or is_unimportable_release:
-                reason = "Release is blocked or cannot be automatically imported by Radarr/Sonarr."
+            if hard_import_failure:
+                reason = "Release contains no eligible video files or has a hard import failure."
                 should_blocklist = True
-            elif is_season_pack and (tracked_state == "importBlocked" or is_unimportable_release):
-                reason = "Season pack release is incomplete or blocked from import."
-                should_blocklist = True
+            elif is_import_warning:
+                # Apply grace period of STUCK_DOWNLOAD_MINUTES before blocklisting warning releases.
+                # If added_dt is missing, treat as within grace period so manual additions are not instantly deleted.
+                if not added_dt or age_minutes < STUCK_DOWNLOAD_MINUTES:
+                    reason = None
+                else:
+                    reason = f"Release import warning or ambiguity persisted ({age_minutes:.1f}m >= {STUCK_DOWNLOAD_MINUTES}m limit)."
+                    should_blocklist = True
             elif added_dt and progress <= 0.05 and age_minutes >= STUCK_DOWNLOAD_MINUTES:
                 reason = f"Progress is low ({progress*100:.2f}% <= 5%) after {age_minutes:.1f} minutes (limit: {STUCK_DOWNLOAD_MINUTES}m)."
                 should_blocklist = True
@@ -692,42 +633,6 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
             status_act = "remove and blocklist" if do_blocklist else "clear from queue without blocklisting (already in library)"
             print(f"  -> [DRY RUN] Would {status_act}: {title}")
 
-
-
-def get_all_radarr_movies(api_key, base_url):
-    headers = {"X-Api-Key": api_key}
-    url = f"{base_url}/api/v3/movie"
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    movies = response.json()
-    # Filter for movies that are 'missing'
-    missing_movies = {}
-    for movie in movies:
-        tmdb_id = movie.get("tmdbId")
-        has_file = movie.get("hasFile")
-        title = movie.get("title") or (get_tmdb_title(tmdb_id, TMDB_API_KEY) if tmdb_id else None)
-        print(f"Radarr Movie: {title}, Status: {movie.get('status')}, HasFile: {has_file}, TMDB ID: {tmdb_id}")
-        if tmdb_id and has_file is False:
-            missing_movies[tmdb_id] = title or f"TMDB {tmdb_id}"
-    return missing_movies
-
-def get_all_sonarr_series(api_key, base_url):
-    headers = {"X-Api-Key": api_key}
-    url = f"{base_url}/api/v3/series"
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    series_list = response.json()
-    missing_series = {}
-    for series in series_list:
-        tmdb_id = series.get("tmdbId")
-        stats = series.get("statistics", {})
-        episode_file_count = stats.get("episodeFileCount", 0)
-        episode_count = stats.get("episodeCount", 0)
-        title = series.get("title") or (get_tmdb_title(tmdb_id, TMDB_API_KEY, media_type="tv") if tmdb_id else None)
-        print(f"Sonarr Series: {title}, Status: {series.get('status')}, EpisodeFileCount: {episode_file_count}/{episode_count}, TMDB ID: {tmdb_id}")
-        if tmdb_id and episode_file_count < episode_count:
-            missing_series[tmdb_id] = title or f"TMDB {tmdb_id}"
-    return missing_series
 
 def get_jellyseerr_library_media(api_key, base_url):
     headers = {"X-Api-Key": api_key}
@@ -1055,8 +960,7 @@ def generate_missing_media_report(dry_run=False):
                         "requested_by": requester,
                     }
                     ready_jellyseerr.append(req_obj)
-                else:
-                    pass  # Keep old Jellyseerr request
+                # else: keep old Jellyseerr request without declining
             else:
                 remaining_str = format_timedelta(remaining)
                 if tmdb_id in radarr_missing:

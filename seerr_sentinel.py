@@ -13,10 +13,13 @@ Usage:
 
 import os
 import sys
+import json
+import time
 import subprocess
 import argparse
-import requests
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import requests
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -48,6 +51,7 @@ _ALL_OPTIONAL_VARS = {
     "RELEASE_BUFFER_DAYS": "7",
     "DELETION_DELAY_DAYS": "2",
     "KEEP_REQUESTS_OLDER_THAN_DAYS": "14",
+    "DELETE_NOT_MANAGED_JELLYSEERR": "true",
     "STUCK_DOWNLOAD_MINUTES": "20.0",
     "MAX_DOWNLOAD_HOURS": "6.0",
     "DAEMON_INTERVAL_SECONDS": "60",
@@ -403,10 +407,6 @@ def main() -> None:
         sys.exit(_run_script("sentinel_import.py", extra))
 
     elif args.command in ("all", "daemon"):
-        import json
-        import time
-        from datetime import datetime, timezone, timedelta
-        
         def _should_run(job: str, interval_minutes: int) -> bool:
             fpath = Path("/tmp/seerr_sentinel_schedule.json")
             if not fpath.exists(): 

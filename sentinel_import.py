@@ -16,6 +16,7 @@ import time
 
 # Config centralisée (charge aussi le .env)
 from seerr_sentinel import load_config
+from sentinel_search import is_released
 
 _cfg = load_config([
     "DOWNLOADS_PATH",
@@ -35,19 +36,10 @@ SONARR_VARS = {
     "URL": _cfg["SONARR_URL"],
 }
 
-REQUIRED_VARS = {
-    "DOWNLOADS_PATH": _cfg["DOWNLOADS_PATH"],
-    "TMDB_API_KEY": _cfg["TMDB_API_KEY"],
-    "RADARR_API_KEY": _cfg["RADARR_API_KEY"],
-    "SONARR_API_KEY": _cfg["SONARR_API_KEY"],
-    "RADARR_URL": _cfg["RADARR_URL"],
-    "SONARR_URL": _cfg["SONARR_URL"],
-}
-
 class MediaImporter:
     def __init__(self):
-        self.downloads_path = REQUIRED_VARS["DOWNLOADS_PATH"]
-        self.tmdb_key = REQUIRED_VARS["TMDB_API_KEY"]
+        self.downloads_path = _cfg["DOWNLOADS_PATH"]
+        self.tmdb_key = _cfg["TMDB_API_KEY"]
         self.tmdb_cache = {}
 
     def normalize(self, text):
@@ -139,44 +131,9 @@ class MediaImporter:
     def is_released(self, item_type, item):
         """
         Determines if the media item is currently released based on available dates.
-        Returns True if at least one release date is in the past.
-        Returns False if all known future dates are in the future, or no dates are present.
+        Delegates to sentinel_search.is_released.
         """
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        
-        if item_type == "movie":
-            fields = ["digitalRelease", "physicalRelease", "releaseDate"]
-            has_any_date = False
-            
-            for f in fields:
-                date_str = item.get(f)
-                if date_str:
-                    has_any_date = True
-                    try:
-                        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                        if dt <= now:
-                            return True # Found a date in the past, it's released
-                    except ValueError:
-                        pass
-            
-            if not has_any_date:
-                return item.get("status") == "released"
-                
-            return False # Has dates, but all are in the future
-
-        elif item_type == "episode":
-            air_date_str = item.get("airDateUtc")
-            if air_date_str:
-                try:
-                    dt = datetime.fromisoformat(air_date_str.replace("Z", "+00:00"))
-                    if dt > now:
-                        return False # Future air date
-                except ValueError:
-                    pass
-            return True # Default to True if no date or date is past
-
-        return True
+        return is_released(item_type, item)
 
     def get_downloads_content(self):
         content = []
@@ -992,7 +949,6 @@ class SonarrImporter(MediaImporter):
                 except Exception:
                     pass
                 total_injected = 0
-                total_skipped = 0
                 for m in matches:
                     result = self.force_injection(s['id'], m['path'], dest_path, existing)
                     total_injected += len(result)
