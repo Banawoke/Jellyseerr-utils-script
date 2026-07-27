@@ -528,7 +528,7 @@ def delete_sonarr_series(api_key, base_url, tmdb_id):
 
 def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
     headers = {"X-Api-Key": api_key}
-    url = f"{base_url}/api/v3/queue"
+    url = f"{base_url}/api/v3/queue?pageSize=200&includeUnknownSeriesItems=true&includeUnknownMovieItems=true"
     response = requests.get(url, headers=headers)
     response.raise_for_status()
     data = response.json()
@@ -544,6 +544,30 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
         if dl_id:
             download_id_counts[dl_id] = download_id_counts.get(dl_id, 0) + 1
 
+    # Pre-fetch library state (hasFile) for items in queue to avoid blocklisting already-imported media
+    episodes_has_file = {}
+    movies_has_file = {}
+    
+    if app_name.lower() == "sonarr":
+        series_ids = set(r.get("seriesId") for r in records if r.get("seriesId"))
+        for s_id in series_ids:
+            try:
+                ep_resp = requests.get(f"{base_url}/api/v3/episode?seriesId={s_id}", headers=headers, timeout=10)
+                if ep_resp.status_code == 200:
+                    for ep in ep_resp.json():
+                        episodes_has_file[ep["id"]] = ep.get("hasFile", False)
+            except Exception:
+                pass
+    elif app_name.lower() == "radarr":
+        movie_ids = set(r.get("movieId") for r in records if r.get("movieId"))
+        for m_id in movie_ids:
+            try:
+                m_resp = requests.get(f"{base_url}/api/v3/movie/{m_id}", headers=headers, timeout=10)
+                if m_resp.status_code == 200:
+                    movies_has_file[m_id] = m_resp.json().get("hasFile", False)
+            except Exception:
+                pass
+
     print(f"\nEvaluating downloads in {app_name}...")
     for r in records:
         size = r.get("size", 0)
@@ -557,77 +581,116 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
             
         added_str = r.get("added")
         added_dt = parse_iso_datetime(added_str)
-        if not added_dt:
-            print(f"  [?] Skipping {title} (No added date)")
-            continue
-            
-        if added_dt.tzinfo is None:
+        if added_dt and added_dt.tzinfo is None:
             added_dt = added_dt.replace(tzinfo=timezone.utc)
             
-        age_hours = (now - added_dt).total_seconds() / 3600.0
-        age_minutes = (now - added_dt).total_seconds() / 60.0
+        age_hours = (now - added_dt).total_seconds() / 3600.0 if added_dt else 0.0
+        age_minutes = (now - added_dt).total_seconds() / 60.0 if added_dt else 0.0
         
+        # Check if media is ALREADY in the library (hasFile=True)
+        already_imported = False
+        if app_name.lower() == "sonarr":
+            ep_ids = r.get("episodeIds", [])
+            if not ep_ids and "episodeId" in r:
+                ep_ids = [r["episodeId"]]
+            if ep_ids and all(episodes_has_file.get(eid, False) for eid in ep_ids):
+                already_imported = True
+        elif app_name.lower() == "radarr":
+            m_id = r.get("movieId")
+            if m_id and movies_has_file.get(m_id, False):
+                already_imported = True
+
         reason = None
-        ep_ids = r.get("episodeIds", [])
-        if not ep_ids and "episodeId" in r:
-            ep_ids = [r["episodeId"]]
+        should_blocklist = True
+
+        if already_imported:
+            reason = f"Media is already imported in {app_name} library (hasFile=True). Clearing stale queue entry."
+            should_blocklist = False
+        else:
+            ep_ids = r.get("episodeIds", [])
+            if not ep_ids and "episodeId" in r:
+                ep_ids = [r["episodeId"]]
+                
+            dl_id = r.get("downloadId")
+            is_season_pack = (
+                len(ep_ids) > 1 
+                or r.get("fullSeason", False) 
+                or (dl_id is not None and download_id_counts.get(dl_id, 0) > 1)
+            )
+
+            tracked_state = r.get("trackedDownloadState", "")
+            tracked_status = r.get("trackedDownloadStatus", "")
+            status_msgs = []
+            for m in r.get("statusMessages", []):
+                if isinstance(m, dict):
+                    if "title" in m:
+                        status_msgs.append(str(m["title"]))
+                    for msg in m.get("messages", []):
+                        status_msgs.append(str(msg))
+                elif isinstance(m, str):
+                    status_msgs.append(m)
             
-        dl_id = r.get("downloadId")
-        is_season_pack = (
-            len(ep_ids) > 1 
-            or r.get("fullSeason", False) 
-            or (dl_id is not None and download_id_counts.get(dl_id, 0) > 1)
-        )
+            msg_text = " ".join(status_msgs).lower()
+            is_unimportable_release = (
+                (tracked_status == "warning" and (progress >= 0.99 or r.get("status") == "completed"))
+                or any(k in msg_text for k in [
+                    "not imported", "missing from", "no files", "eligible for import",
+                    "no video", "failed to import", "sample", "title mismatch",
+                    "not possible", "mismatch", "unknown series", "unknown movie", "rejected",
+                    "unable to import", "found multiple", "multiple movies", "multiple series"
+                ])
+            )
 
-        tracked_state = r.get("trackedDownloadState", "")
-        status_msgs = []
-        for m in r.get("statusMessages", []):
-            if isinstance(m, dict):
-                if "title" in m:
-                    status_msgs.append(str(m["title"]))
-                for msg in m.get("messages", []):
-                    status_msgs.append(str(msg))
-            elif isinstance(m, str):
-                status_msgs.append(m)
-        is_incomplete_release = any(
-            "not imported" in msg.lower() or "missing from" in msg.lower()
-            for msg in status_msgs
-        )
-
-        # Only blocklist for incomplete missing episodes if it's a Season Pack (never individual episodes)
-        if is_season_pack and (tracked_state == "importBlocked" or is_incomplete_release):
-            reason = "Season pack release is incomplete or blocked from import (missing expected episodes in pack)."
-        elif progress <= 0.05 and age_minutes >= STUCK_DOWNLOAD_MINUTES:
-            reason = f"Progress is low ({progress*100:.2f}% <= 5%) after {age_minutes:.1f} minutes (limit: {STUCK_DOWNLOAD_MINUTES}m)."
-        elif age_hours >= MAX_DOWNLOAD_HOURS:
-            reason = f"Download taking too long ({age_hours:.1f}h >= {MAX_DOWNLOAD_HOURS}h), currently at {progress*100:.2f}%."
+            # Blocklist if release is blocked/unimportable (no eligible files) or incomplete season pack
+            if tracked_state in ("importBlocked", "importFailed") or is_unimportable_release:
+                reason = "Release is blocked or cannot be automatically imported by Radarr/Sonarr."
+                should_blocklist = True
+            elif is_season_pack and (tracked_state == "importBlocked" or is_unimportable_release):
+                reason = "Season pack release is incomplete or blocked from import."
+                should_blocklist = True
+            elif added_dt and progress <= 0.05 and age_minutes >= STUCK_DOWNLOAD_MINUTES:
+                reason = f"Progress is low ({progress*100:.2f}% <= 5%) after {age_minutes:.1f} minutes (limit: {STUCK_DOWNLOAD_MINUTES}m)."
+                should_blocklist = True
+            elif added_dt and age_hours >= MAX_DOWNLOAD_HOURS:
+                reason = f"Download taking too long ({age_hours:.1f}h >= {MAX_DOWNLOAD_HOURS}h), currently at {progress*100:.2f}%."
+                should_blocklist = True
             
         if reason:
-            print(f" Mark for removal: {title}")
+            action_desc = "Mark for cleanup (no blocklist)" if not should_blocklist else "Mark for removal & blocklist"
+            print(f" {action_desc}: {title}")
             print(f" Reason: {reason}")
-            stuck_records.append((r, reason))
+            stuck_records.append((r, reason, should_blocklist))
         else:
             print(f"Keep: {title} | Progress: {progress*100:.2f}% | Age: {age_minutes:.1f} minutes | Status: {r.get('status')}")
             
     if not stuck_records:
         return
 
-    print(f"\n--- Removing {len(stuck_records)} stuck downloads in {app_name} ---")
-    for r, reason in stuck_records:
+    print(f"\n--- Cleaning {len(stuck_records)} queue entries in {app_name} ---")
+    for r, reason, do_blocklist in stuck_records:
         title = r.get("title", "Unknown")
         record_id = r.get("id")
+        blocklist_str = "true" if do_blocklist else "false"
         
         if not dry_run:
             delete_url = f"{base_url}/api/v3/queue/{record_id}"
-            params = {"removeFromClient": "true", "blocklist": "true"}
+            params = {"removeFromClient": "true", "blocklist": blocklist_str}
             try:
                 delete_response = requests.delete(delete_url, headers=headers, params=params)
                 delete_response.raise_for_status()
-                print(f"  -> Successfully removed and blocklisted: {title}")
+                status_act = "removed and blocklisted" if do_blocklist else "cleared from queue (already in library)"
+                print(f"  -> Successfully {status_act}: {title}")
+            except requests.exceptions.HTTPError as he:
+                if he.response is not None and he.response.status_code == 404:
+                    # Item was already removed as part of a batch/season pack removal
+                    pass
+                else:
+                    print(f"  -> Failed to remove {title}: {he}")
             except Exception as e:
                 print(f"  -> Failed to remove {title}: {e}")
         else:
-            print(f"  -> [DRY RUN] Would remove and blocklist: {title}")
+            status_act = "remove and blocklist" if do_blocklist else "clear from queue without blocklisting (already in library)"
+            print(f"  -> [DRY RUN] Would {status_act}: {title}")
 
 
 

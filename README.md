@@ -212,8 +212,8 @@ When running the `all` command (or the `daemon` mode), the script manages its ow
 4. **Declines** the Jellyseerr request and sends a notification to the requester (via configured notification agents)
 5. The declined request stays visible in Jellyseerr — the user can re-request with one click
 6. Keeps Seerr requests older than `KEEP_REQUESTS_OLDER_THAN_DAYS` days (no decline sent for those)
-7. **Automated Queue Blocklisting**: Detects stuck downloads (<= 5% progress after `STUCK_DOWNLOAD_MINUTES` or > `MAX_DOWNLOAD_HOURS`) and incomplete season packs (`importBlocked` or missing expected episodes in pack) and automatically removes & blocklists them (`removeFromClient=true`, `blocklist=true`) so indexers try other releases
-8. **Episode Safeguard**: Protects single individual episode downloads from incomplete-pack blocklisting
+7. **Smart Queue Cleanup**: For downloads lingering in the queue whose media is **already imported in the library** (`hasFile=True`), clears the stale queue entry without blocklisting (`blocklist=false`) to keep Sonarr/Radarr in sync
+8. **Automated Queue Blocklisting**: For truly stuck downloads (<= 5% progress after `STUCK_DOWNLOAD_MINUTES` or > `MAX_DOWNLOAD_HOURS`) or unimportable/corrupt releases with missing files, automatically removes & blocklists them (`removeFromClient=true`, `blocklist=true`) so indexers can try other releases
 
 ### `sentinel_import` logic
 
