@@ -285,7 +285,10 @@ class MediaImporter:
                 if status == "downloading" or tracked_state in ("downloading", "importpending"):
                     media_id = r.get(id_field)
                     if media_id:
-                        active.setdefault(media_id, []).append(r.get("title", "?"))
+                        title = r.get("title", "?")
+                        titles = active.setdefault(media_id, [])
+                        if title not in titles:
+                            titles.append(title)
         except Exception as e:
             print(f"  -> [WARN] Could not fetch active downloads from queue: {e}")
         return active
@@ -469,7 +472,8 @@ class RadarrImporter(MediaImporter):
 
             # Skip if this exact movie is currently being downloaded
             if m['id'] in active_downloading:
-                dl_titles = ", ".join(active_downloading[m['id']])
+                titles_list = active_downloading[m['id']]
+                dl_titles = ", ".join(titles_list[:3]) + (f" (+{len(titles_list) - 3} more)" if len(titles_list) > 3 else "")
                 print(f"{m['title']} -> [SKIP] Actively downloading ({dl_titles}). Import deferred to next cycle.")
                 continue
 
@@ -820,7 +824,8 @@ class SonarrImporter(MediaImporter):
         for s in missing:
             # Skip if this exact series is currently being downloaded
             if s['id'] in active_downloading:
-                dl_titles = ", ".join(active_downloading[s['id']])
+                titles_list = active_downloading[s['id']]
+                dl_titles = ", ".join(titles_list[:3]) + (f" (+{len(titles_list) - 3} more)" if len(titles_list) > 3 else "")
                 print(f"{s['title']} -> [SKIP] Actively downloading ({dl_titles}). Import deferred to next cycle.")
                 continue
 
