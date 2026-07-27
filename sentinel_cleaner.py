@@ -537,6 +537,13 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
     stuck_records = []
     now = datetime.now(timezone.utc)
     
+    # Count occurrences of downloadId in queue to detect season packs (multiple episodes sharing the same download)
+    download_id_counts = {}
+    for r in records:
+        dl_id = r.get("downloadId")
+        if dl_id:
+            download_id_counts[dl_id] = download_id_counts.get(dl_id, 0) + 1
+
     print(f"\nEvaluating downloads in {app_name}...")
     for r in records:
         size = r.get("size", 0)
@@ -561,7 +568,36 @@ def clean_stuck_downloads(api_key, base_url, app_name, dry_run=False):
         age_minutes = (now - added_dt).total_seconds() / 60.0
         
         reason = None
-        if progress <= 0.05 and age_minutes >= STUCK_DOWNLOAD_MINUTES:
+        ep_ids = r.get("episodeIds", [])
+        if not ep_ids and "episodeId" in r:
+            ep_ids = [r["episodeId"]]
+            
+        dl_id = r.get("downloadId")
+        is_season_pack = (
+            len(ep_ids) > 1 
+            or r.get("fullSeason", False) 
+            or (dl_id is not None and download_id_counts.get(dl_id, 0) > 1)
+        )
+
+        tracked_state = r.get("trackedDownloadState", "")
+        status_msgs = []
+        for m in r.get("statusMessages", []):
+            if isinstance(m, dict):
+                if "title" in m:
+                    status_msgs.append(str(m["title"]))
+                for msg in m.get("messages", []):
+                    status_msgs.append(str(msg))
+            elif isinstance(m, str):
+                status_msgs.append(m)
+        is_incomplete_release = any(
+            "not imported" in msg.lower() or "missing from" in msg.lower()
+            for msg in status_msgs
+        )
+
+        # Only blocklist for incomplete missing episodes if it's a Season Pack (never individual episodes)
+        if is_season_pack and (tracked_state == "importBlocked" or is_incomplete_release):
+            reason = "Season pack release is incomplete or blocked from import (missing expected episodes in pack)."
+        elif progress <= 0.05 and age_minutes >= STUCK_DOWNLOAD_MINUTES:
             reason = f"Progress is low ({progress*100:.2f}% <= 5%) after {age_minutes:.1f} minutes (limit: {STUCK_DOWNLOAD_MINUTES}m)."
         elif age_hours >= MAX_DOWNLOAD_HOURS:
             reason = f"Download taking too long ({age_hours:.1f}h >= {MAX_DOWNLOAD_HOURS}h), currently at {progress*100:.2f}%."

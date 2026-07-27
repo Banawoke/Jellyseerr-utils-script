@@ -859,18 +859,66 @@ def process_sonarr(series_data=None):
         headers = {"X-Api-Key": SONARR_API_KEY, "Content-Type": "application/json"}
         
         if top["type"] == "SeasonSearch":
-            payload = {
-                "name": "SeasonSearch",
-                "seriesId": top["series_id"],
-                "seasonNumber": top["season_num"]
-            }
-            try:
-                resp = requests.post(cmd_url, json=payload, headers=headers, timeout=10)
-                resp.raise_for_status()
-            except requests.exceptions.ReadTimeout:
-                print("  [WARN] Request timed out, but Sonarr search was likely triggered asynchronously.")
-            print(f"Triggered SeasonSearch for {top['print_title']} - Mode: {top['label']}")
-            record_search(f"season_{top['series_id']}_{top['season_num']}", f"{top['type']} ({top['label']})", item_type="season", title=top["title"])
+            series_id = top["series_id"]
+            season_num = top["season_num"]
+            force_grabbed = False
+
+            # Force Grab is ONLY used for targeted fallback/blocked scenarios
+            is_escalated_scenario = (
+                "Fallback" in top.get("label", "")
+                or top.get("fail_count", 0) > 0
+            )
+
+            if is_escalated_scenario:
+                # Force Grab via Release API (overrides cutoff & title mismatch rejections for partial/blocked seasons)
+                try:
+                    rel_url = f"{SONARR_URL}/api/v3/release?seriesId={series_id}&seasonNumber={season_num}"
+                    rel_resp = requests.get(rel_url, headers={"X-Api-Key": SONARR_API_KEY}, timeout=15)
+                    if rel_resp.status_code == 200:
+                        releases = rel_resp.json()
+                        
+                        # Universal Filter: Exclude releases that are blocklisted or already grabbed, ensure season pack
+                        valid_releases = []
+                        for r in releases:
+                            rejections = [str(rej).lower() for rej in r.get("rejections", [])]
+                            if any("blocklisted" in rej or "blacklisted" in rej or "same torrent hash" in rej for rej in rejections):
+                                continue
+                            
+                            s_num = r.get("seasonNumber")
+                            is_full_season = r.get("fullSeason", False)
+                            is_single_ep = r.get("singleEpisode", False)
+
+                            if s_num == season_num and (is_full_season or not is_single_ep):
+                                valid_releases.append(r)
+                        
+                        if valid_releases:
+                            valid_releases.sort(key=lambda x: (x.get("seeders") or 0, x.get("size") or 0), reverse=True)
+                            target_release = valid_releases[0]
+                            target_release["seriesId"] = series_id
+                            
+                            grab_url = f"{SONARR_URL}/api/v3/release"
+                            grab_resp = requests.post(grab_url, json=target_release, headers=headers, timeout=15)
+                            if grab_resp.status_code == 200:
+                                print(f"  [FORCE GRAB] Triggered download for '{target_release.get('title')}' (escalated scenario, overriding title/cutoff checks)")
+                                force_grabbed = True
+                except Exception as _e:
+                    print(f"  [WARN] Release search / force grab failed ({_e}), falling back to standard SeasonSearch.")
+
+            # Standard Sonarr API command for standard searches (or fallback if Force Grab didn't trigger)
+            if not force_grabbed:
+                payload = {
+                    "name": "SeasonSearch",
+                    "seriesId": series_id,
+                    "seasonNumber": season_num
+                }
+                try:
+                    resp = requests.post(cmd_url, json=payload, headers=headers, timeout=10)
+                    resp.raise_for_status()
+                except requests.exceptions.ReadTimeout:
+                    print("  [WARN] Request timed out, but Sonarr search was likely triggered asynchronously.")
+                print(f"Triggered standard SeasonSearch for {top['print_title']} - Mode: {top['label']}")
+
+            record_search(f"season_{series_id}_{season_num}", f"{top['type']} ({top['label']})", item_type="season", title=top["title"])
             return True
             
         elif top["type"] == "EpisodeSearch":

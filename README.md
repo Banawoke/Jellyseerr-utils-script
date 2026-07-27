@@ -6,7 +6,7 @@
 Automation suite for managing **Seerr**, **Radarr**, and **Sonarr**. I was struggling to keep my library clean so i made this script. The goal of SeerrSentinel is to automate media discovery, library cleanup, and file imports for Seerr, Radarr, and Sonarr.
 
 >[!IMPORTANT]
-> This is very early software, any help will be verry welcome it work with my use case but may need some tweeks for yours. Report any bug or feature request 😊.
+> Any help will be very welcome! It works with my use case but may need some tweaks for yours. Report any bug or feature request 😊.
 
 ## Scripts
 
@@ -198,24 +198,28 @@ When running the `all` command (or the `daemon` mode), the script manages its ow
 ### `sentinel_search` logic
 
 1. Checks for active commands (global lock)
-3. Looks for a missing Radarr candidate → triggers `MoviesSearch`
-4. If nothing on Radarr side → looks at Sonarr → `SeasonSearch` or `EpisodeSearch`
-5. Per-cycle quota (12h) to avoid flooding indexers
+2. Looks for missing Radarr candidates → triggers `MoviesSearch`
+3. Looks at Sonarr missing episodes → determines Pack Search vs. Individual Search
+4. **Standard Search & Targeted Force Grab Escalation**: Uses standard search commands by default. For targeted blocked Sonarr season scenarios (partially downloaded seasons with cutoff conflicts, fallback pack searches, or previous search failures), it automatically escalates to a **Force Grab via Release API** (`POST /api/v3/release`) to bypass automatic rejection rules (`Existing file meets cutoff` or `Unknown Series`)
+5. **Blocklist-Aware Selection**: Excludes blacklisted and previously failed releases, allowing the engine to automatically step over incomplete releases to find valid packs
+6. Per-cycle quota (12h) to avoid flooding indexers
 
 ### `sentinel_cleaner` logic
 
 1. Fetches all missing media from Radarr/Sonarr
 2. Ignores recent releases (`RELEASE_BUFFER_DAYS`)
 3. After `DELETION_DELAY_DAYS` days → deletes from Radarr/Sonarr
-4. **Declines** the Jellyseerr request and sends a notification to the requester (via the configured notification agents: Discord, Email, etc.)
+4. **Declines** the Jellyseerr request and sends a notification to the requester (via configured notification agents)
 5. The declined request stays visible in Jellyseerr — the user can re-request with one click
 6. Keeps Seerr requests older than `KEEP_REQUESTS_OLDER_THAN_DAYS` days (no decline sent for those)
-7. Detects stuck downloads in Radarr/Sonarr queues (<= 5% progress after `STUCK_DOWNLOAD_MINUTES` or any progress after `MAX_DOWNLOAD_HOURS`) and blocklists them
+7. **Automated Queue Blocklisting**: Detects stuck downloads (<= 5% progress after `STUCK_DOWNLOAD_MINUTES` or > `MAX_DOWNLOAD_HOURS`) and incomplete season packs (`importBlocked` or missing expected episodes in pack) and automatically removes & blocklists them (`removeFromClient=true`, `blocklist=true`) so indexers try other releases
+8. **Episode Safeguard**: Protects single individual episode downloads from incomplete-pack blocklisting
 
 ### `sentinel_import` logic
 
 1. Scans the `DOWNLOADS_PATH` folder
 2. Matches files against missing media using title tokens + TMDB aliases
-3. Skip import if the content is downloading
-4. Creates hard-links in Radarr/Sonarr media folders (ensure the container user has write access)
-5. Triggers a `RescanMovie` / `RescanSeries` and waits for confirmation
+3. **Smart Hardlink Detection**: Differentiates between hardlinks within the `downloads` directory (legitimate multi-source torrents) and external library hardlinks, eliminating false-positive skips
+4. Skips import if content is actively downloading
+5. Creates hard-links in Radarr/Sonarr media folders
+6. Triggers `RescanMovie` / `RescanSeries`, waits for confirmation, and re-fetches library state for fresh verification
