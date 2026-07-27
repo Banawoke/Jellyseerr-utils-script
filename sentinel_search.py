@@ -11,7 +11,6 @@ import sys
 import json
 import requests
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 # Config centralisée (load .env)
 from seerr_sentinel import load_config
@@ -176,35 +175,39 @@ def record_search(key, search_type, item_type="movie", title=None):
     print(f"             Cycle: {entry['count']}/{max_s} | Fails: {entry.get('fail_count', 0)} | Next search: {fmt_rem(next_dt)} | Cycle resets: {fmt_rem(cycle_end_dt)}")
 
 
-def record_search_failed(key, title=None):
-    """Increment the fail counter when a search returned no results."""
-    history = load_history()
-    if key not in history:
-        return  # Never searched, nothing to fail
-    entry = history[key]
-    entry["fail_count"] = entry.get("fail_count", 0) + 1
-    if title and "title" not in entry:
-        entry["title"] = title
-    save_history(history)
-    print(f"  [FAIL] Previous search found nothing for '{title or key}' → fail_count now {entry['fail_count']}")
-
 
 def mark_failed_if_previous_search(key, title=None):
     """
     If the item has a recorded search in history AND it still appears in
-    wanted/missing (caller's responsibility to only call this when that's true),
-    the previous search clearly returned nothing → increment fail_count.
-    Does nothing if this is the first time we see this item.
+    wanted/missing, check if that specific search attempt was already evaluated.
+    Only increment fail_count ONCE per actual search executed.
     """
     history = load_history()
     entry = history.get(key, {})
-    if entry.get("last_search"):  # Was searched before → previous attempt failed
-        record_search_failed(key, title=title)
+    last_search = entry.get("last_search")
+    last_failed_check = entry.get("last_failed_check")
+
+    if last_search and last_search != last_failed_check:
+        entry["fail_count"] = min(entry.get("fail_count", 0) + 1, entry.get("count", 1))
+        entry["last_failed_check"] = last_search
+        if title and "title" not in entry:
+            entry["title"] = title
+        save_history(history)
+        print(f"  [FAIL] Previous search on {last_search[:19]} found nothing for '{title or key}' → fail_count now {entry['fail_count']}")
 
 
 def get_fail_count(key):
     history = load_history()
     return history.get(key, {}).get("fail_count", 0)
+
+
+def get_cycle_stats(key, item_type):
+    """Returns (searches_count, max_searches, fail_count)."""
+    history = load_history()
+    entry = history.get(key, {})
+    _, max_s = get_cycle_config(item_type)
+    return entry.get("count", 0), max_s, entry.get("fail_count", 0)
+
 
 
 def get_last_search_timestamp(key):
@@ -577,11 +580,10 @@ def process_radarr():
 
         # Check Cycle Quota (after potential fail increment)
         if not check_cycle_quota(key, "movie"):
+            cnt, max_s, fails = get_cycle_stats(key, "movie")
             rem = get_cycle_reset_time(key, "movie")
-            if rem is not None:
-                print(f"  Skipping {title}: Cycle quota reached (resets in {rem:.0f}m).")
-            else:
-                print(f"  Skipping {title}: Cycle quota reached.")
+            rem_str = f"resets in {rem:.0f}m" if rem is not None else "reset pending"
+            print(f"  Skipping {title}: Cycle quota reached ({cnt}/{max_s} searches done, {fails} failed, {rem_str}).")
             continue
 
         if is_cooled_down(last_search):
@@ -607,14 +609,14 @@ def process_radarr():
     print(f"\n  Radarr Search Queue ({len(candidates)} candidate(s)):")
     for i, c in enumerate(candidates):
         _, rem = get_next_search_time(c["key"])
-        fails = c["fail_count"]
+        cnt, max_s, fails = get_cycle_stats(c["key"], "movie")
         marker = "→" if i == 0 else " "
         def fmt_m(m):
             if m <= 0: return "Ready"
             h = int(m // 60)
             mins = int(m % 60)
             return f"in {h}h{mins:02d}m" if h > 0 else f"in {mins}m"
-        print(f"  {marker} #{i+1} {c['title']} | Fails: {fails} | Next: {fmt_m(rem)}")
+        print(f"  {marker} #{i+1} {c['title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {fmt_m(rem)}")
     print()
     
     # Pick top candidate
@@ -744,33 +746,21 @@ def process_sonarr(series_data=None):
             prefer_season = False
             search_type_label = f"Individual Search (S{season_num}E{ep_num})"
 
-        print(f"Decision for {series_title} Season {season_num}: {search_type_label} [files={file_count}, total={total_in_season}, missing={missing_count}]")
+        files_unfiled = max(0, total_in_season - file_count)
+        if files_unfiled != missing_count:
+            missing_info = f"missing_wanted={missing_count} (out of {files_unfiled} unfiled)"
+        else:
+            missing_info = f"missing={missing_count}"
 
-        # Decision Helper
-        def parse_ts(iso_str):
-            if not iso_str:
-                return datetime.min.replace(tzinfo=timezone.utc)
-            try:
-                dt = datetime.fromisoformat(iso_str)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except ValueError:
-                return datetime.min.replace(tzinfo=timezone.utc)
-
-        # Logic to decide what to trigger next if the preferred one is in cooldown but NOT the other
-        # Or just follow the 'prefer_season' and fallback as needed.
-        
-        candidates_checks = []
+        print(f"Decision for {series_title} Season {season_num}: {search_type_label} [files={file_count}/{total_in_season}, {missing_info}]")
 
         # Define check routines
         def check_season():
             if not check_cycle_quota(season_key, "season"):
+                cnt, max_s, fails = get_cycle_stats(season_key, "season")
                 rem = get_cycle_reset_time(season_key, "season")
-                if rem is not None:
-                    print(f"Skipping {series_title} Season {season_num}: Cycle quota reached (resets in {rem:.0f}m).")
-                else:
-                    print(f"Skipping {series_title} Season {season_num}: Cycle quota reached.")
+                rem_str = f"resets in {rem:.0f}m" if rem is not None else "reset pending"
+                print(f"Skipping {series_title} Season {season_num}: Cycle quota reached ({cnt}/{max_s} searches done, {fails} failed, {rem_str}).")
                 return None
             if not is_cooled_down(season_last_search_iso):
                 print(f"Skipping {series_title} Season {season_num}: Cooldown active.")
@@ -788,11 +778,10 @@ def process_sonarr(series_data=None):
 
         def check_episode():
              if not check_cycle_quota(ep_key, "episode"):
+                 cnt, max_s, fails = get_cycle_stats(ep_key, "episode")
                  rem = get_cycle_reset_time(ep_key, "episode")
-                 if rem is not None:
-                     print(f"Skipping {series_title} S{season_num}E{ep_num}: Cycle quota reached (resets in {rem:.0f}m).")
-                 else:
-                     print(f"Skipping {series_title} S{season_num}E{ep_num}: Cycle quota reached.")
+                 rem_str = f"resets in {rem:.0f}m" if rem is not None else "reset pending"
+                 print(f"Skipping {series_title} S{season_num}E{ep_num}: Cycle quota reached ({cnt}/{max_s} searches done, {fails} failed, {rem_str}).")
                  return None
              if not is_cooled_down(ep_last_search_iso):
                  print(f"Skipping {series_title} S{season_num}E{ep_num}: Cooldown active.")
@@ -850,15 +839,17 @@ def process_sonarr(series_data=None):
     # --- Queue Display ---
     print(f"\n  Sonarr Search Queue ({len(actions)} candidate(s)):")
     for i, a in enumerate(actions):
-        _, rem = get_next_search_time(a.get("key", ""))
-        fails = a.get("fail_count", 0)
+        key = a.get("key", "")
+        item_type = "season" if a["type"] == "SeasonSearch" else "episode"
+        cnt, max_s, fails = get_cycle_stats(key, item_type)
+        _, rem = get_next_search_time(key)
         marker = "→" if i == 0 else " "
         def fmt_m_s(m):
             if m <= 0: return "Ready"
             h = int(m // 60)
             mins = int(m % 60)
             return f"in {h}h{mins:02d}m" if h > 0 else f"in {mins}m"
-        print(f"  {marker} #{i+1} [{a['label']}] {a['print_title']} | Fails: {fails} | Next: {fmt_m_s(rem)}")
+        print(f"  {marker} #{i+1} [{a['label']}] {a['print_title']} | Searches: {cnt}/{max_s} (Fails: {fails}) | Next: {fmt_m_s(rem)}")
     print()
     
     # Execute Top Action

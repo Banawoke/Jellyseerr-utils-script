@@ -20,27 +20,26 @@ import sys
 import requests
 from dotenv import load_dotenv
 
-# Load .env from the same directory
+# Load .env from script directory or project root
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-JELLYSEER_API_KEY = os.environ.get("JELLYSEER_API_KEY") or os.environ.get("JELLYSEER_API_KEY")
+JELLYSEER_API_KEY = os.environ.get("JELLYSEER_API_KEY")
 JELLYSEER_URL = os.environ.get("JELLYSEER_URL")
-DECLINE_MESSAGE = os.environ.get(
-    "JELLYSEERR_DECLINE_MESSAGE",
-    "The media could not be found or downloaded within the allotted time. The request has been automatically cancelled.",
+DECLINE_MESSAGE = (
+    os.environ.get("JELLYSEER_DECLINE_MESSAGE")
+    or os.environ.get("JELLYSEERR_DECLINE_MESSAGE")
+    or "The media could not be found or downloaded within the allotted time. The request has been automatically cancelled."
 )
 
-if not JELLYSEER_API_KEY or not JELLYSEER_URL:
-    print("ERROR: JELLYSEER_API_KEY and JELLYSEER_URL must be set in your .env file.")
-    sys.exit(1)
-
-HEADERS = {"X-Api-Key": JELLYSEER_API_KEY, "Content-Type": "application/json"}
+def get_headers():
+    return {"X-Api-Key": JELLYSEER_API_KEY, "Content-Type": "application/json"}
 
 
 def fetch_pending_requests(limit=10):
     """Fetch the first N unavailable requests from Jellyseerr."""
     url = f"{JELLYSEER_URL}/api/v1/request?filter=unavailable&sort=added&sortDirection=desc&skip=0&take={limit}"
-    resp = requests.get(url, headers=HEADERS)
+    resp = requests.get(url, headers=get_headers())
     resp.raise_for_status()
     return resp.json().get("results", [])
 
@@ -48,11 +47,15 @@ def fetch_pending_requests(limit=10):
 def send_decline(request_id, message):
     """Call the Jellyseerr decline endpoint for a given request ID."""
     url = f"{JELLYSEER_URL}/api/v1/request/{request_id}/decline"
-    resp = requests.post(url, headers=HEADERS, json={"reason": message})
+    resp = requests.post(url, headers=get_headers(), json={"reason": message})
     return resp
 
 
 def main():
+    if not JELLYSEER_API_KEY or not JELLYSEER_URL:
+        print("ERROR: JELLYSEER_API_KEY and JELLYSEER_URL must be set in your .env file.")
+        sys.exit(1)
+
     print("=" * 60)
     print("  SeerrSentinel — Decline Notification Test")
     print("=" * 60)

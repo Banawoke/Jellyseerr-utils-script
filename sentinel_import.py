@@ -11,7 +11,6 @@ import sys
 import requests
 import re
 import argparse
-from pathlib import Path
 import unicodedata
 import time
 
@@ -227,24 +226,75 @@ class MediaImporter:
                     except: pass
         return False
 
-    def is_hardlinked(self, source_path):
-        """Returns True if any video file in source_path has a hardlink count > 1."""
+
+    def _build_downloads_inode_map(self):
+        """
+        Builds and returns a dict mapping inode -> count of occurrences in self.downloads_path.
+        Calculated once per run to avoid repeated disk walks.
+        """
+        inode_counts = {}
+        if not os.path.exists(self.downloads_path):
+            return inode_counts
+        try:
+            for root, _, files in os.walk(self.downloads_path):
+                for f in files:
+                    if f.lower().endswith(('.mkv', '.mp4', '.avi')):
+                        try:
+                            ino = os.stat(os.path.join(root, f)).st_ino
+                            inode_counts[ino] = inode_counts.get(ino, 0) + 1
+                        except OSError: pass
+        except Exception: pass
+        return inode_counts
+
+    def _is_hardlinked_outside_downloads(self, source_path, downloads_inode_counts=None):
+        """
+        Per-file check: returns True only if video files in source_path
+        have hardlinks that exist OUTSIDE the downloads folder.
+
+        A hardlink count > 1 alone is not enough to call something a false
+        positive. The same episode can appear in multiple torrent sources
+        inside downloads (season pack + individual episode), producing
+        nlink > 1 while never having been imported into a media library.
+
+        Algorithm:
+          1. Collect inodes + nlink of all video files in source_path.
+          2. Use pre-built downloads_inode_counts (or walk downloads folder if missing).
+          3. If nlink > downloads_count for any file, at least one link lives
+             outside downloads → the file is truly imported elsewhere.
+        """
+        source_inodes = {}  # inode -> total nlink
         if os.path.isfile(source_path):
             if source_path.lower().endswith(('.mkv', '.mp4', '.avi')):
                 try:
-                    return os.stat(source_path).st_nlink > 1
-                except:
-                    pass
+                    st = os.stat(source_path)
+                    if st.st_nlink > 1:
+                        source_inodes[st.st_ino] = st.st_nlink
+                except OSError: pass
         elif os.path.isdir(source_path):
             for root, _, files in os.walk(source_path):
                 for f in files:
                     if f.lower().endswith(('.mkv', '.mp4', '.avi')):
                         try:
-                            if os.stat(os.path.join(root, f)).st_nlink > 1:
-                                return True
-                        except:
-                            pass
-        return False
+                            fp = os.path.join(root, f)
+                            st = os.stat(fp)
+                            if st.st_nlink > 1:
+                                source_inodes[st.st_ino] = st.st_nlink
+                        except OSError: pass
+
+        if not source_inodes:
+            return False  # No hardlinked files → not imported elsewhere
+
+        # Count appearances of each source inode within downloads if not pre-provided
+        if downloads_inode_counts is None:
+            downloads_inode_counts = self._build_downloads_inode_map()
+
+        # If any inode has more links than its appearances in downloads,
+        # at least one link lives outside → truly imported elsewhere
+        for ino, nlink in source_inodes.items():
+            if nlink > downloads_inode_counts.get(ino, 0):
+                return True
+
+        return False  # All links are within downloads → safe to import
 
     def link_file(self, source, target):
         if os.path.exists(target): return False
@@ -327,6 +377,7 @@ class MediaImporter:
                     requests.delete(del_url, params={"removeFromClient": "true", "blocklist": "false"}, headers={"X-Api-Key": api_key})
         except Exception as e:
             print(f"  -> [WARN] Error cleaning queue for {id_field_name}={item_id}: {e}")
+
 
 class RadarrImporter(MediaImporter):
     def __init__(self):
@@ -458,6 +509,7 @@ class RadarrImporter(MediaImporter):
 
         disk_items = self.get_downloads_content()
         video_files = [i["path"] for i in disk_items if i["type"] == "file" and i["name"].lower().endswith(('.mkv', '.mp4', '.avi'))]
+        downloads_inode_counts = self._build_downloads_inode_map()
 
         # Fetch active downloads once (keyed by movieId) to block concurrent imports
         active_downloading = self.get_active_download_ids(self.url, self.api_key, "movieId")
@@ -537,8 +589,8 @@ class RadarrImporter(MediaImporter):
                     print("  -> Already linked (Inode). Skipping.")
                     continue
 
-                if self.is_hardlinked(match['path']):
-                    print("  -> [SKIP] File is already imported elsewhere (hardlink count > 1). False positive avoided.")
+                if self._is_hardlinked_outside_downloads(match['path'], downloads_inode_counts):
+                    print("  -> [SKIP] File is already imported elsewhere (external hardlink). False positive avoided.")
                     continue
 
                 if self.force_injection(m, match['path'], dest_path):
@@ -589,7 +641,8 @@ class SonarrImporter(MediaImporter):
                 break
         return ids
 
-    def get_episodes(self, series_id):
+    def get_episodes_data(self, series_id):
+        """Returns tuple (existing_set, raw_episodes_list)."""
         try:
             ep = requests.get(f"{self.url}/api/v3/episode?seriesId={series_id}", headers={"X-Api-Key": self.api_key}).json()
             ef = requests.get(f"{self.url}/api/v3/episodefile?seriesId={series_id}", headers={"X-Api-Key": self.api_key}).json()
@@ -601,8 +654,13 @@ class SonarrImporter(MediaImporter):
                      fp = file_paths.get(e.get('episodeFileId'))
                      if fp and os.path.exists(fp):
                          existing.add((e.get('seasonNumber'), e.get('episodeNumber')))
-            return existing
-        except: return set()
+            return existing, ep
+        except Exception:
+            return set(), []
+
+    def get_episodes(self, series_id):
+        existing, _ = self.get_episodes_data(series_id)
+        return existing
 
     def verify_import(self, series_id, injected_episodes):
         """Wait a bit then verify episodes have been imported."""
@@ -690,6 +748,11 @@ class SonarrImporter(MediaImporter):
         match_path_s = re.search(r'[/\\].*?S(\d+)', source_path, re.IGNORECASE)
         if match_path_s:
             path_season_hint = int(match_path_s.group(1))
+        # [H4] Also detect "Season N" / "Saison N" folders (e.g. ".../Shadowhunters Season 3/")
+        if path_season_hint is None:
+            match_path_season = re.search(r'(?:[Ss]eason|[Ss]aison)\s*(\d+)', source_path)
+            if match_path_season:
+                path_season_hint = int(match_path_season.group(1))
 
         for src in files_to_link:
             filename = os.path.basename(src)
@@ -705,19 +768,28 @@ class SonarrImporter(MediaImporter):
                 s_num = int(match_se.group(1))
                 e_num = int(match_se.group(2))
             else:
-                # --- Composite number detection ---
-                # Filenames like "201 - titre.mkv" or "1012 - titre.mkv"
-                # where the number encodes season+episode (e.g. 2+01 or 10+12)
-                lead_match = re.match(r'^(\d{3,4})(?:\s*[-._])', filename)
-                if lead_match and path_season_hint is not None:
-                    raw_num = lead_match.group(1)
-                    # Try to decompose using the known season from parent path
-                    s_prefix = str(path_season_hint)
-                    if raw_num.startswith(s_prefix):
-                        ep_part = raw_num[len(s_prefix):]
-                        if ep_part and ep_part.isdigit():
-                            s_num = path_season_hint
-                            e_num = int(ep_part)
+                # --- NxNN format detection (e.g. "3x01", "1x22") ---
+                # \b prevents matching resolutions like "1920x1080" (>2 digits before x)
+                # and aspect ratios like "4x3" (only 1 digit after x, we require 2-3)
+                match_nxn = re.search(r'\b(\d{1,2})x(\d{2,3})\b', filename, re.IGNORECASE)
+                if match_nxn:
+                    s_num = int(match_nxn.group(1))
+                    e_num = int(match_nxn.group(2))
+
+                if e_num is None:
+                    # --- Composite number detection ---
+                    # Filenames like "201 - titre.mkv" or "1012 - titre.mkv"
+                    # where the number encodes season+episode (e.g. 2+01 or 10+12)
+                    lead_match = re.match(r'^(\d{3,4})(?:\s*[-._])', filename)
+                    if lead_match and path_season_hint is not None:
+                        raw_num = lead_match.group(1)
+                        # Try to decompose using the known season from parent path
+                        s_prefix = str(path_season_hint)
+                        if raw_num.startswith(s_prefix):
+                            ep_part = raw_num[len(s_prefix):]
+                            if ep_part and ep_part.isdigit():
+                                s_num = path_season_hint
+                                e_num = int(ep_part)
 
                 # --- Generic number fallback ---
                 if e_num is None:
@@ -738,7 +810,7 @@ class SonarrImporter(MediaImporter):
                     s_num = 1
 
             if e_num is None:
-                # print(f"  -> [SKIP] Could not determine episode number for {filename}")
+                print(f"  -> [SKIP] {filename}: could not detect episode number (no SxxExx / NxNN / composite pattern).")
                 continue
 
             if (s_num, e_num) in existing_episodes:
@@ -814,6 +886,7 @@ class SonarrImporter(MediaImporter):
 
         disk_items = self.get_downloads_content()
         video_files = [i["path"] for i in disk_items if i["type"] == "file" and i["name"].lower().endswith(('.mkv', '.mp4', '.avi'))]
+        downloads_inode_counts = self._build_downloads_inode_map()
 
         # Fetch active downloads once (keyed by seriesId) to block concurrent imports
         active_downloading = self.get_active_download_ids(self.url, self.api_key, "seriesId")
@@ -880,8 +953,8 @@ class SonarrImporter(MediaImporter):
                     if self.check_inode_match(m['path'], dest_path):
                         already_linked = True
                         valid_matches.append(m)
-                    elif self.is_hardlinked(m['path']):
-                        print(f"  -> [SKIP] '{m['name']}' is already imported elsewhere. False positive avoided.")
+                    elif self._is_hardlinked_outside_downloads(m['path'], downloads_inode_counts):
+                        print(f"  -> [SKIP] '{m['name']}' is already imported elsewhere (external hardlink). False positive avoided.")
                     else:
                         valid_matches.append(m)
                 
@@ -898,8 +971,26 @@ class SonarrImporter(MediaImporter):
                             print(f"  -> Waiting for consistency scan to complete...")
                             self.wait_for_command(self.url, self.api_key, cmd_id)
                 
-                # Injection
-                existing = self.get_episodes(s['id'])
+                # Reload existing episodes AFTER the consistency rescan so the
+                # injector works from the freshest known state of the library.
+                existing, ep_list = self.get_episodes_data(s['id'])
+
+                # Debug: show which episodes Sonarr still considers missing after rescan
+                try:
+                    if ep_list:
+                        _still_wanted = sorted([
+                            f"S{e.get('seasonNumber', 0):02d}E{e.get('episodeNumber', 0):02d}"
+                            for e in ep_list
+                            if not e.get('hasFile') and e.get('monitored') and self.is_released("episode", e)
+                        ])
+                        if _still_wanted:
+                            _preview = _still_wanted[:10]
+                            _suffix = f" (+{len(_still_wanted) - 10} more)" if len(_still_wanted) > 10 else ""
+                            print(f"  -> [DEBUG] Still missing after rescan ({len(_still_wanted)} ep.): {', '.join(_preview)}{_suffix}")
+                        elif already_linked:
+                            print(f"  -> [DEBUG] All monitored/released episodes are now imported. No injection needed.")
+                except Exception:
+                    pass
                 total_injected = 0
                 total_skipped = 0
                 for m in matches:
@@ -921,6 +1012,21 @@ class SonarrImporter(MediaImporter):
                         print(f"  -> [SKIP] Source matched but contains no video files (torrent pending?). Nothing to inject.")
                     else:
                         print(f"  -> All matched episodes already imported ({len(existing)} existing). Nothing to inject.")
+                        # Show what Sonarr still wants — helps diagnose why injection was skipped
+                        try:
+                            if ep_list:
+                                _still_wanted = sorted([
+                                    f"S{e.get('seasonNumber', 0):02d}E{e.get('episodeNumber', 0):02d}"
+                                    for e in ep_list
+                                    if not e.get('hasFile') and e.get('monitored')
+                                ])
+                                if _still_wanted:
+                                    _preview = _still_wanted[:10]
+                                    _suffix = f" (+{len(_still_wanted) - 10} more)" if len(_still_wanted) > 10 else ""
+                                    print(f"  -> [HINT] Sonarr still wants: {', '.join(_preview)}{_suffix}")
+                                    print(f"  -> [HINT] If files are on disk, check [SKIP] lines above for episode detection failures.")
+                        except Exception:
+                            pass
             else:
                 print(f"{s['title']} (TMDB ID: {s.get('tmdbId', '?')}) -> No match found on disk")
 
