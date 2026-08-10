@@ -44,6 +44,7 @@ services:
       # - DELETION_DELAY_DAYS=2
       # - KEEP_REQUESTS_OLDER_THAN_DAYS=14
       # - DELETE_NOT_MANAGED_JELLYSEERR=true
+      # - PARTIAL_CLEANUP_ENABLED=true
       # - STUCK_DOWNLOAD_MINUTES=20.0
       # - MAX_DOWNLOAD_HOURS=6.0
       # - DAEMON_INTERVAL_SECONDS=60
@@ -175,6 +176,7 @@ python3 seerr_sentinel.py import --sonarr --force-id 42
 | `DELETION_DELAY_DAYS` | optional | Grace period before deletion (default: `2`) |
 | `KEEP_REQUESTS_OLDER_THAN_DAYS` | optional | Keep Seerr requests older than N days (default: `14`) |
 | `DELETE_NOT_MANAGED_JELLYSEERR` | optional | Allow cleaner to delete media not tracked by Jellyseerr (default: `true`) |
+| `PARTIAL_CLEANUP_ENABLED` | optional | Enable partial series cleanup for fully aired seasons (default: `true`) |
 | `STUCK_DOWNLOAD_MINUTES` | optional | Minutes to wait before removing a download with <= 5% progress (default: `20.0`) |
 | `MAX_DOWNLOAD_HOURS` | optional | Maximum hours before a download is removed regardless of progress (default: `6.0`) |
 | `DAEMON_INTERVAL_SECONDS` | optional | How often the background daemon checks the timers (default: `60`) |
@@ -215,6 +217,7 @@ When running the `all` command (or the `daemon` mode), the script manages its ow
 6. Keeps Seerr requests older than `KEEP_REQUESTS_OLDER_THAN_DAYS` days (no decline sent for those)
 7. **Smart Queue Cleanup**: For downloads lingering in the queue whose media is **already imported in the library** (`hasFile=True`), clears the stale queue entry without blocklisting (`blocklist=false`) to keep Sonarr/Radarr in sync
 8. **Automated Queue Blocklisting**: For truly stuck downloads (<= 5% progress after `STUCK_DOWNLOAD_MINUTES` or > `MAX_DOWNLOAD_HOURS`) or unimportable/corrupt releases with missing files, automatically removes & blocklists them (`removeFromClient=true`, `blocklist=true`) so indexers can try other releases
+9. **Partial Series Cleanup**: Detects series with partially missing episodes in fully aired seasons (`PARTIAL_CLEANUP_ENABLED`). Removes the incomplete season files from disk (`remove_seasons`) and unmonitors them while preserving other complete seasons.
 
 ### `sentinel_import` logic
 

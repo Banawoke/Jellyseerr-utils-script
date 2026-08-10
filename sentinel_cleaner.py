@@ -40,6 +40,7 @@ KEEP_REQUESTS_OLDER_THAN_DAYS = int(os.environ.get("KEEP_REQUESTS_OLDER_THAN_DAY
 STUCK_DOWNLOAD_MINUTES = float(os.environ.get("STUCK_DOWNLOAD_MINUTES", "20.0"))
 MAX_DOWNLOAD_HOURS = float(os.environ.get("MAX_DOWNLOAD_HOURS", "6.0"))
 DELETE_NOT_MANAGED = os.environ.get("DELETE_NOT_MANAGED_JELLYSEERR", "true").lower() in ("true", "1", "yes")
+PARTIAL_CLEANUP_ENABLED = os.environ.get("PARTIAL_CLEANUP_ENABLED", "true").lower() in ("true", "1", "yes")
 
 PENDING_FILE = "/tmp/jellyseerr_pending_deletions.json"
 
@@ -333,27 +334,60 @@ def get_sonarr_missing_episodes(api_key, base_url):
         report_seasons = []     # All seasons with missing files (for logging)
         
         for season in seasons:
-            if not season.get("monitored"):
-                continue
-            monitored_seasons_count += 1
-            
             stats = season.get("statistics", {})
             file_count = stats.get("episodeFileCount", 0)
             total_count = stats.get("episodeCount", 0)
+            total_eps_all = stats.get("totalEpisodeCount", total_count)
             season_size = stats.get("sizeOnDisk", 0)
+            is_monitored = season.get("monitored")
+
+            if not is_monitored:
+                if file_count == 0 and season_size == 0:
+                    continue
+                if file_count >= total_eps_all and total_eps_all > 0:
+                    continue
+
+            monitored_seasons_count += 1
 
             # Ghost detection: API says files exist but sizeOnDisk is 0
             if file_count > 0 and season_size == 0:
                 print(f"  [GHOST] Season {season.get('seasonNumber')}: {file_count} files but sizeOnDisk=0")
                 file_count = 0
             
+            # Effective total count for missing check
+            effective_total = max(total_count, total_eps_all)
+
+            # Check if season is fully aired
+            series_status = series.get("status", "").lower()
+            series_ended = series_status == "ended"
+            no_next_airing = not get_sonarr_next_airing(series)
+            season_fully_aired = (total_count >= total_eps_all and total_count > 0) or series_ended or (no_next_airing and total_count > 0)
+
             # If ANY files are missing, we report it
-            if file_count < total_count and total_count > 0:
+            if file_count < effective_total and effective_total > 0:
                 report_seasons.append(season.get("seasonNumber"))
                 
-                # We only take ACTION (unmonitor/delete) if 0 files exist
+                # A season with 0 files is only ACTIONABLE if it has actual aired episodes
+                # and is fully aired. Future/announced seasons with 0 episodes are skipped.
                 if file_count == 0:
-                    actionable_seasons.append(season.get("seasonNumber"))
+                    if season_fully_aired and total_count > 0:
+                        actionable_seasons.append(season.get("seasonNumber"))
+                    else:
+                        sn = season.get("seasonNumber")
+                        print(f"  [FUTURE] Season {sn}: 0/{effective_total} files — future/un-aired season, skipping")
+                
+                # Partial cleanup: season has SOME files but not all
+                # If the season is fully aired (no future episodes), treat as actionable
+                elif PARTIAL_CLEANUP_ENABLED and file_count > 0:
+                    if season_fully_aired:
+                        sn = season.get("seasonNumber")
+                        print(f"  [PARTIAL] Season {sn}: {file_count}/{effective_total} files "
+                              f"— season fully aired, marking for cleanup")
+                        actionable_seasons.append(sn)
+                    else:
+                        sn = season.get("seasonNumber")
+                        print(f"  [PARTIAL] Season {sn}: {file_count}/{effective_total} files "
+                              f"— season still airing, skipping")
         
         # Empty series detection: all monitored seasons have 0 episodes AND 0 files
         # This catches series like "The Hunting Wives" where Sonarr has no episode data
@@ -371,13 +405,16 @@ def get_sonarr_missing_episodes(api_key, base_url):
             
         title = series.get("title") or get_tmdb_title(tmdb_id, TMDB_API_KEY, media_type="tv")
         
-        # Determine action based on ACTIONABLE seasons
-        if actionable_seasons and len(actionable_seasons) == monitored_seasons_count:
+        if not actionable_seasons:
+            continue
+
+        # Determine action based on ACTIONABLE seasons:
+        # Delete whole series if ALL relevant seasons are incomplete/actionable;
+        # otherwise unmonitor and delete files for ONLY the incomplete seasons.
+        if len(actionable_seasons) == monitored_seasons_count:
              action = "delete_series"
-        elif actionable_seasons:
-             action = "unmonitor_seasons"
         else:
-             action = "report_only"
+             action = "remove_seasons"
              
         missing_items[tmdb_id] = {
             "title": title or f"TMDB {tmdb_id}",
@@ -434,6 +471,39 @@ def unmonitor_sonarr_seasons(api_key, base_url, series_id, seasons_to_unmonitor)
         print(f"Unmonitored seasons {seasons_to_unmonitor} for series {series_data.get('title')}")
     else:
         print(f"Seasons {seasons_to_unmonitor} were already unmonitored for {series_data.get('title')}")
+
+def delete_sonarr_season_files(api_key, base_url, series_id, seasons_to_delete):
+    """Unmonitors specified seasons and deletes all associated episode files from disk."""
+    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
+    
+    # 1. Unmonitor seasons
+    unmonitor_sonarr_seasons(api_key, base_url, series_id, seasons_to_delete)
+    
+    # 2. Fetch all episodes for the series
+    ep_url = f"{base_url}/api/v3/episode?seriesId={series_id}"
+    resp = requests.get(ep_url, headers={"X-Api-Key": api_key})
+    if resp.status_code != 200:
+        print(f"  [WARN] Failed to fetch episodes for series ID {series_id}")
+        return
+    
+    episodes = resp.json()
+    files_to_delete = set()
+    for ep in episodes:
+        if ep.get("seasonNumber") in seasons_to_delete and ep.get("episodeFileId"):
+            files_to_delete.add(ep["episodeFileId"])
+            
+    # 3. Delete episode files from disk via Sonarr API
+    deleted_count = 0
+    for file_id in files_to_delete:
+        del_url = f"{base_url}/api/v3/episodefile/{file_id}"
+        try:
+            del_resp = requests.delete(del_url, headers={"X-Api-Key": api_key})
+            del_resp.raise_for_status()
+            deleted_count += 1
+        except Exception as e:
+            print(f"  [WARN] Failed to delete episode file ID {file_id}: {e}")
+            
+    print(f"Deleted {deleted_count} episode file(s) for season(s) {seasons_to_delete} of series ID {series_id}.")
 
 def delete_sonarr_series(api_key, base_url, tmdb_id):
     headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
@@ -659,18 +729,30 @@ def perform_deletions_list(radarr_api_key, radarr_url, sonarr_api_key, sonarr_ur
         print("Nothing to delete from Radarr.")
 
     if deletion_data["sonarr"]:
-        print(f"Processing series in Sonarr: {deletion_data['sonarr']}")
+        formatted_series = []
+        for item in deletion_data["sonarr"]:
+            if isinstance(item, dict):
+                title = item.get("title", f"TMDB {item.get('tmdb_id')}")
+                if item.get("action") == "remove_seasons":
+                    seasons = item.get("seasons", [])
+                    formatted_series.append(f"{title} (Season cleanup {seasons})")
+                else:
+                    formatted_series.append(f"{title} (Full deletion)")
+            else:
+                formatted_series.append(f"TMDB {item}")
+        print(f"Processing series in Sonarr: {', '.join(formatted_series)}")
+
         for item in deletion_data["sonarr"]:
             if isinstance(item, dict):
                 tmdb_id = item["tmdb_id"]
                 action = item.get("action", "delete_series")
                 if action == "delete_series":
                     delete_sonarr_series(sonarr_api_key, sonarr_url, tmdb_id)
-                elif action == "unmonitor_seasons":
+                elif action == "remove_seasons":
                     series_id = item.get("series_id")
                     seasons = item.get("seasons", [])
                     if series_id and seasons:
-                        unmonitor_sonarr_seasons(sonarr_api_key, sonarr_url, series_id, seasons)
+                        delete_sonarr_season_files(sonarr_api_key, sonarr_url, series_id, seasons)
             else:
                  delete_sonarr_series(sonarr_api_key, sonarr_url, item)
     else:
@@ -928,14 +1010,25 @@ def generate_missing_media_report(dry_run=False):
             
             if age_days >= DELETION_DELAY_DAYS:
 
-                # Skip report_only sonarr entries early — they are incomplete but should NOT be deleted
+                # Skip report_only sonarr entries early — series has files and missing seasons are un-aired/future
                 if tmdb_id in sonarr_missing and sonarr_missing[tmdb_id].get("action") == "report_only":
-                    print(f"  PARTIAL {title} | {requester} | Skipped — has files, only partial missing")
+                    print(f"  {title} | By: {requester} | SKIPPED — existing files preserved (missing season is un-aired/future)")
                     continue
+
+                # Determine display title and whether to decline Jellyseerr request
+                s_action = sonarr_missing[tmdb_id].get("action") if tmdb_id in sonarr_missing else "delete"
+                s_seasons = sonarr_missing[tmdb_id].get("seasons", []) if tmdb_id in sonarr_missing else []
+                
+                if s_action == "remove_seasons":
+                    display_title = f"{title} (Season {s_seasons})"
+                    action_str = "Season files cleanup"
+                else:
+                    display_title = title
+                    action_str = "Series deletion"
 
                 # Ready for deletion
                 marker = "→"
-                print(f"  {marker} {title} | By: {requester} | READY — will be deleted now | Requested: {age_str} ago")
+                print(f"  {marker} {display_title} | By: {requester} | READY — {action_str} now | Requested: {age_str} ago")
                 
                 # Add to execution lists
                 if tmdb_id in radarr_missing:
@@ -945,11 +1038,9 @@ def generate_missing_media_report(dry_run=False):
                     ready_sonarr.append(sonarr_missing[tmdb_id])
                     ready_sonarr_count += 1
                  
-                # Check if we should delete the Jellyseerr request
-                if age_days < KEEP_REQUESTS_OLDER_THAN_DAYS:
-                    # Extract the request_id from the latest Jellyseerr request (for decline notification)
+                # Only decline Jellyseerr request if the full media (series/movie) is being deleted
+                if age_days < KEEP_REQUESTS_OLDER_THAN_DAYS and s_action != "remove_seasons":
                     latest_req = requests_list[0] if requests_list else {}
-                    # Prepare jellyseerr deletion object
                     req_obj = {
                         "title": title,
                         "media_id": media_id,
@@ -960,14 +1051,23 @@ def generate_missing_media_report(dry_run=False):
                         "requested_by": requester,
                     }
                     ready_jellyseerr.append(req_obj)
-                # else: keep old Jellyseerr request without declining
             else:
                 remaining_str = format_timedelta(remaining)
+                s_action = sonarr_missing[tmdb_id].get("action") if tmdb_id in sonarr_missing else "delete"
+                s_seasons = sonarr_missing[tmdb_id].get("seasons", []) if tmdb_id in sonarr_missing else []
+                
+                if s_action == "remove_seasons":
+                    display_title = f"{title} (Season {s_seasons})"
+                    act_label = "Season cleanup"
+                else:
+                    display_title = title
+                    act_label = "Deletion"
+
                 if tmdb_id in radarr_missing:
                     pending_radarr_count += 1
                 elif tmdb_id in sonarr_missing:
                     pending_sonarr_count += 1
-                print(f"  WAITING... {title} | By: {requester} | Deletion in: {remaining_str} | Requested: {age_str} ago")
+                print(f"  WAITING... {display_title} | By: {requester} | {act_label} in: {remaining_str} | Requested: {age_str} ago")
         else:
              print(f"  NOT IN JELLYSEERR {title} — No request date found")
 
@@ -989,9 +1089,17 @@ def generate_missing_media_report(dry_run=False):
     # Perform Deletions
     if dry_run:
         print("\n--- DRY RUN ---")
-        print(f"Would delete {len(ready_radarr)} movies from Radarr")
-        print(f"Would delete {len(ready_sonarr)} series from Sonarr")
-        print(f"Would delete {len(ready_jellyseerr)} requests from Jellyseerr")
+        print(f"Would delete {len(ready_radarr)} movie(s) from Radarr")
+
+        full_series_count = sum(1 for item in ready_sonarr if not isinstance(item, dict) or item.get("action") == "delete_series")
+        season_cleanup_count = sum(1 for item in ready_sonarr if isinstance(item, dict) and item.get("action") == "remove_seasons")
+
+        if season_cleanup_count > 0:
+            print(f"Would process {len(ready_sonarr)} series in Sonarr ({full_series_count} full deletion(s), {season_cleanup_count} season cleanup(s))")
+        else:
+            print(f"Would delete {len(ready_sonarr)} series from Sonarr")
+
+        print(f"Would decline {len(ready_jellyseerr)} request(s) from Jellyseerr")
         if ready_jellyseerr:
              for r in ready_jellyseerr:
                  print(f"  - {r['title']} (Requested by {r['requested_by']} on {r['request_date']})")
