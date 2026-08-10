@@ -202,9 +202,8 @@ When running the `all` command (or the `daemon` mode), the script manages its ow
 1. Checks for active commands (global lock)
 2. Looks for missing Radarr candidates → triggers `MoviesSearch`
 3. Looks at Sonarr missing episodes → determines Pack Search vs. Individual Search
-4. **Standard Search & Targeted Force Grab Escalation**: Uses standard search commands by default. For targeted blocked Sonarr season scenarios (partially downloaded seasons with cutoff conflicts, fallback pack searches, or previous search failures), it automatically escalates to a **Force Grab via Release API** (`POST /api/v3/release`) to bypass automatic rejection rules (`Existing file meets cutoff` or `Unknown Series`)
-5. **Blocklist-Aware Selection**: Excludes blacklisted and previously failed releases, allowing the engine to automatically step over incomplete releases to find valid packs
-6. Per-cycle quota (12h) to avoid flooding indexers
+4. **Standard Search Triggers**: Triggers standard `SeasonSearch` or `EpisodeSearch` commands on Sonarr
+5. Per-cycle quota (12h) to avoid flooding indexers
 
 ### `sentinel_cleaner` logic
 
